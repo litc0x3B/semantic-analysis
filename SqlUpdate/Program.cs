@@ -64,7 +64,7 @@ try
     Console.ReadLine();
 
     // ==================================================================================
-    // 4. APPLY CHANGES (ADD, MODIFY, DELETE)
+    // 4. APPLY CHANGES
     // ==================================================================================
     Console.WriteLine("Step 4: Applying changes (Add, Modify, Delete)...");
 
@@ -126,7 +126,7 @@ try
         Console.WriteLine($"   Rounds: {d.Rounds.Count}");
         foreach(var r in d.Rounds)
         {
-             Console.WriteLine($"     > Round {r.Number}: Winner={(r.Winner?.Nickname ?? "None")}");
+            Console.WriteLine($"     > Round {r.Number}: Winner={(r.Winner?.Nickname ?? "None")}");
         }
     }
 }

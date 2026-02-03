@@ -18,7 +18,6 @@ CREATE TABLE DuelParticipants (
 CREATE TABLE Rounds (
     Id SERIAL PRIMARY KEY,
     Number INT NOT NULL,
-    HasFinished INT NOT NULL DEFAULT 0,
     DuelId INT NOT NULL,
     WinnerId INT,
     FOREIGN KEY (DuelId) REFERENCES Duels(Id),
