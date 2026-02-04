@@ -1,186 +1,379 @@
-import uuid
+from typing import Any, Dict, Set, List, Optional
+import operator
 
-class KripkeScale:
-    """
-    Represents the ontological structure (T-Box).
-    Manages concepts, relations, and their hierarchical order (ISA).
-    """
-    def __init__(self):
-        self.concepts = {}
-        self.relations = {}
 
-    def register_concept(self, name, parents=None):
-        if parents is None:
-            parents = []
-        c = Concept(name, parents)
-        self.concepts[name] = c
-        return c
+class Constraint:
+    """Base class for constraints."""
+    def check(self, value: Any) -> bool:
+        raise NotImplementedError
+    
+    def implies(self, other: 'Constraint') -> bool:
+        """Returns True if (Self -> Other)."""
+        raise NotImplementedError
 
-    def register_relation(self, name, domain, range_concept, parents=None):
-        if parents is None:
-            parents = []
-        r = Relation(name, domain, range_concept, parents)
-        self.relations[name] = r
-        return r
+class IntRange(Constraint):
+    """Interval constraint: min_val <= x <= max_val"""
+    def __init__(self, min_val=float('-inf'), max_val=float('inf')):
+        self.min_val = min_val
+        self.max_val = max_val
 
-class Concept:
-    """
-    ADT: Concept. Represents a category of objects.
-    """
-    def __init__(self, name, parents):
-        self.name = name
-        self.parents = parents
+    def check(self, value: Any) -> bool:
+        if not isinstance(value, (int, float)): return False
+        return self.min_val <= value <= self.max_val
 
-    def is_a(self, other_concept):
-        """Checks the transitive ISA relationship."""
-        if self == other_concept:
+    def implies(self, other: 'Constraint') -> bool:
+        if isinstance(other, IntRange):
+            return self.min_val >= other.min_val and self.max_val <= other.max_val
+        if isinstance(other, AnyValue):
             return True
-        for parent in self.parents:
-            if parent.is_a(other_concept):
-                return True
         return False
 
     def __repr__(self):
-        return f"<Concept: {self.name}>"
+        return f"[{self.min_val}..{self.max_val}]"
 
-class Relation(Concept):
-    """
-    ADT: Relation. A special kind of Concept connecting two Concepts.
-    """
-    def __init__(self, name, domain, range_concept, parents):
-        super().__init__(name, parents)
-        self.domain = domain
-        self.range_concept = range_concept
+class ValueSet(Constraint):
+    """Set constraint: x IN allowed_values"""
+    def __init__(self, allowed_values: Set[Any]):
+        self.allowed = allowed_values
+
+    def check(self, value: Any) -> bool:
+        return value in self.allowed
+
+    def implies(self, other: 'Constraint') -> bool:
+        if isinstance(other, ValueSet):
+            return self.allowed.issubset(other.allowed)
+        if isinstance(other, AnyValue):
+            return True
+        return False
 
     def __repr__(self):
-        return f"<Relation: {self.name} ({self.domain.name} -> {self.range_concept.name})>"
+        return f"In{self.allowed}"
 
-class Frame:
-    """
-    ADT: Frame. Represents an instance of a Concept (Object) or Relation (Link).
-    """
-    def __init__(self, concept, data=None, uid=None):
-        self.uid = uid if uid else str(uuid.uuid4())[:8]
-        self.concept = concept
-        self.data = data if data else {}
+class AnyValue(Constraint):
+    """Matches anything."""
+    def check(self, value: Any) -> bool: return True
+    def implies(self, other: 'Constraint') -> bool: 
+        return isinstance(other, AnyValue)
+    def __repr__(self): return "Any"
 
-    def is_instance_of(self, target_concept):
+class BaseConcept:
+    def check(self, data: Any) -> bool:
+        raise NotImplementedError
+    
+    def is_subconcept_of(self, other: 'BaseConcept') -> bool:
+        raise NotImplementedError
+
+    def __and__(self, other):
+        """Concatenation operator (Concept1 ^ Concept2)."""
+        attrs = {}
+        if isinstance(self, CompositeConcept):
+            attrs.update(self.attributes)
+        elif isinstance(self, AtomicConcept):
+            attrs[self.name] = self
+        
+        if isinstance(other, CompositeConcept):
+            attrs.update(other.attributes) 
+        elif isinstance(other, AtomicConcept):
+            attrs[other.name] = other
+            
+        return CompositeConcept(f"({self.name}^{other.name})", attrs)
+
+class AtomicConcept(BaseConcept):
+    def __init__(self, name: str, constraint: Constraint):
+        self.name = name
+        self.constraint = constraint
+
+    def check(self, data: Any) -> bool:
+        return self.constraint.check(data)
+
+    def is_subconcept_of(self, other: 'BaseConcept') -> bool:
+        if isinstance(other, AtomicConcept):
+            return self.name == other.name and self.constraint.implies(other.constraint)
+        return False
+
+    def __repr__(self):
+        return f"Atom({self.name}: {self.constraint})"
+
+class CompositeConcept(BaseConcept):
+    def __init__(self, name: str, attributes: Dict[str, AtomicConcept]):
+        self.name = name
+        self.attributes = attributes
+
+    def check(self, data_dict: Dict[str, Any]) -> bool:
+        if not isinstance(data_dict, dict): return False
+        for attr_name, atom in self.attributes.items():
+            if attr_name not in data_dict: return False
+            if not atom.check(data_dict[attr_name]): return False
+        return True
+
+    def is_subconcept_of(self, other: 'BaseConcept') -> bool:
+        if isinstance(other, AtomicConcept): return False
+        if isinstance(other, CompositeConcept):
+            for key, other_atom in other.attributes.items():
+                if key not in self.attributes: return False
+                if not self.attributes[key].constraint.implies(other_atom.constraint): return False
+            return True
+        return False
+
+    def __repr__(self):
+        return f"Concept[{self.name}]"
+
+class LinkFrame:
+    def __init__(self, name: str, source_type: BaseConcept, dest_type: BaseConcept):
+        self.name = name
+        self.domain = source_type
+        self.range_concept = dest_type
+
+    def is_subframe_of(self, other: 'LinkFrame') -> bool:
         """
-        Checks if this frame is an instance of the target_concept (considering ISA).
+        Subrelation Rule (Covariant):
+        Rel A ISA Rel B if:
+        1. Domain(A) ISA Domain(B)
+        2. Range(A) ISA Range(B)
         """
-        return self.concept.is_a(target_concept)
+        return (self.domain.is_subconcept_of(other.domain) and 
+                self.range_concept.is_subconcept_of(other.range_concept))
 
     def __repr__(self):
-        return f"<Frame[{self.concept.name}]: {self.uid}>"
-
-class Link(Frame):
-    """
-    A specific type of Frame representing an instance of a Relation.
-    """
-    def __init__(self, relation, source_frame, target_frame):
-        super().__init__(relation)
-        self.source = source_frame
-        self.target = target_frame
-
-    def __repr__(self):
-        return f"<Link[{self.concept.name}]: {self.source.uid} -> {self.target.uid}>"
+        return f"RelType<{self.name}>"
 
 class PossibleWorld:
-    """
-    ADT: Possible World (A-Box).
-    Contains the concrete set of instances (Frames) and links.
-    """
     def __init__(self, name):
         self.name = name
-        self.objects = []
-        self.links = []
+        self.objects = {} # uid -> data_dict
 
-    def add_object(self, concept, data=None, uid=None):
-        obj = Frame(concept, data, uid)
-        self.objects.append(obj)
-        return obj
+    def add_object(self, uid, data: Dict[str, Any]):
+        self.objects[uid] = data
+        return uid
 
-    def add_link(self, relation, source_obj, target_obj):
-        # Basic validation
-        if not source_obj.is_instance_of(relation.domain):
-            print(f"[Warning] Source {source_obj} is not an instance of {relation.domain}")
-        if not target_obj.is_instance_of(relation.range_concept):
-            print(f"[Warning] Target {target_obj} is not an instance of {relation.range_concept}")
+    def get_extension(self, concept: BaseConcept) -> List[str]:
+        """
+        Returns the extension of the concept in this world 
+        (list of UIDs of objects that satisfy the concept).
+        """
+        return [uid for uid, data in self.objects.items() if concept.check(data)]
+
+    def __repr__(self):
+        return f"World<{self.name}>"
+
+class KripkeStructure:
+    def __init__(self):
+        self.worlds = {}
+        self.accessibility = {}
+
+    def add_world(self, world: PossibleWorld):
+        self.worlds[world.name] = world
+
+    def add_access(self, from_world, to_world):
+        if from_world not in self.accessibility: self.accessibility[from_world] = []
+        self.accessibility[from_world].append(to_world)
+
+    def get_reachable_extension(self, start_world_name: str, concept: BaseConcept) -> Dict[str, List[str]]:
+        visited = set()
+        queue = [start_world_name]
+        results = {}
+
+        while queue:
+            current_name = queue.pop(0)
+            if current_name in visited:
+                continue
+            visited.add(current_name)
             
-        link = Link(relation, source_obj, target_obj)
-        self.links.append(link)
-        return link
+            world = self.worlds.get(current_name)
+            if world:
+                # Get extension in this world
+                extension = world.get_extension(concept)
+                if extension:
+                    results[current_name] = extension
+            
+            # Add neighbors
+            neighbors = self.accessibility.get(current_name, [])
+            for neighbor in neighbors:
+                if neighbor not in visited:
+                    queue.append(neighbor)
+        
+        return results
 
-    def get_instances(self, concept):
-        return [obj for obj in self.objects if obj.is_instance_of(concept)]
 
-    def get_links(self, relation_concept):
-        return [link for link in self.links if link.is_instance_of(relation_concept)]
+class LinkFrameInstance:
+    def __init__(self, relation_type: LinkFrame, world: PossibleWorld, source_uid: str, target_uid: str):
+        self.relation_type = relation_type
+        self.world = world
+        self.source = source_uid
+        self.target = target_uid
+        self._validate()
+
+    def _validate(self):
+        """Checks if the connected objects satisfy the relation type definition."""
+        src_data = self.world.objects.get(self.source)
+        tgt_data = self.world.objects.get(self.target)
+        
+        if not src_data: raise ValueError(f"Source {self.source} not found.")
+        if not tgt_data: raise ValueError(f"Target {self.target} not found.")
+        
+        if not self.relation_type.domain.check(src_data):
+            raise ValueError(f"Source {self.source} does not satisfy domain {self.relation_type.domain.name}")
+        if not self.relation_type.range_concept.check(tgt_data):
+            raise ValueError(f"Target {self.target} does not satisfy range {self.relation_type.range_concept.name}")
+
+    def is_instance_of(self, target_rel_type: LinkFrame) -> bool:
+        if self.relation_type == target_rel_type: return True
+        return self.relation_type.is_subframe_of(target_rel_type)
+
+    def __repr__(self):
+        return f"Frame[{self.relation_type.name}]({self.source} -> {self.target})"
 
 # ==========================================
-# Scenario Execution
+# Scenario Execution: IoT / Smart Home
 # ==========================================
 
 def run_scenario():
-    print("=== 1-2. Initialization of Domain (University Context) ===")
-    scale = KripkeScale()
+    print("\n" + "="*50)
+    print("TASK 1 & 4: Define Domain & Concepts")
+    print("Domain: IoT Smart Home")
+    print("Structure: Atomic Attributes -> Composite Concepts (Records)")
+    print("="*50)
+    
+    # Attributes
+    atom_proto_any = AtomicConcept("protocol", ValueSet({"WiFi", "ZigBee"}))
+    atom_proto_zig = AtomicConcept("protocol", ValueSet({"ZigBee"}))
+    atom_bat_any   = AtomicConcept("battery", IntRange(0, 100))
+    atom_bat_full  = AtomicConcept("battery", IntRange(80, 100))
+    atom_role_dev  = AtomicConcept("role", ValueSet({"Sensor", "Hub"}))
+    atom_role_sen  = AtomicConcept("role", ValueSet({"Sensor"}))
+    atom_role_hub  = AtomicConcept("role", ValueSet({"Hub"}))
 
-    # --- 4. Describe selected system of concepts ---
-    # Hierarchy:
-    # Person
-    #   ISA Student
-    #   ISA Staff
-    #       ISA Professor
+    # Concepts
+    c_wireless_device = atom_proto_any & atom_bat_any & atom_role_dev
+    c_wireless_device.name = "WirelessDevice"
     
-    c_person = scale.register_concept("Person")
-    c_student = scale.register_concept("Student", parents=[c_person])
-    c_staff = scale.register_concept("Staff", parents=[c_person])
-    c_professor = scale.register_concept("Professor", parents=[c_staff])
-    
-    print(f"Defined Concepts: {[c.name for c in [c_person, c_student, c_staff, c_professor]]}")
+    c_sensor = atom_proto_zig & atom_bat_any & atom_role_sen
+    c_sensor.name = "Sensor"
 
-    # --- 6-7. Describe relations and ISA on relations ---
-    # Relations:
-    # Interact (Person -> Person)
-    #   ISA Mentor (Staff -> Student)
+    c_rel_sensor = c_sensor & atom_bat_full
+    c_rel_sensor.name = "ReliableSensor"
     
-    r_interact = scale.register_relation("Interact", domain=c_person, range_concept=c_person)
-    r_mentor = scale.register_relation("Mentor", domain=c_staff, range_concept=c_student, parents=[r_interact])
-    
-    print(f"Defined Relations: {r_interact.name}, {r_mentor.name} (ISA {r_interact.name})")
+    c_hub = c_wireless_device & atom_role_hub
+    c_hub.name = "Hub"
 
-    # --- 5. Define instances and check instance-of (Concept) ---
-    print("\n=== 5. Working with Concept Instances ===")
-    world = PossibleWorld("Semester 1")
-    
-    alice = world.add_object(c_student, {"name": "Alice"}, uid="Alice")
-    bob = world.add_object(c_professor, {"name": "Dr. Bob"}, uid="Bob")
-    
-    print(f"Created instances: {alice}, {bob}")
+    c_wired_hub = atom_role_hub & atom_proto_any
+    c_wired_hub.name = "WiredHub"
 
-    # Check: Is Bob a Person? (Transitive: Professor -> Staff -> Person)
-    check_bob_person = bob.is_instance_of(c_person)
-    print(f"Check: Is {bob.uid} instance of Person? {check_bob_person} (Expected: True)")
-    
-    # Check: Is Alice a Staff?
-    check_alice_staff = alice.is_instance_of(c_staff)
-    print(f"Check: Is {alice.uid} instance of Staff? {check_alice_staff} (Expected: False)")
+    print(f"[Defined] {c_wireless_device.name}")
+    print(f"[Defined] {c_sensor.name}")
+    print(f"[Defined] {c_rel_sensor.name}")
+    print(f"[Defined] {c_hub.name}")
+    print(f"[Defined] {c_wired_hub.name}")
 
-    # --- 8. Create instances of relations and check instance-of (Relation) ---
-    print("\n=== 8. Working with Relation Instances ===")
+
+    print("\n" + "="*50)
+    print("TASK 5: Concept ISA & Instances")
+    print("="*50)
+
+    # Check ISA
+    print(f"[Check] ReliableSensor ISA Sensor? {c_rel_sensor.is_subconcept_of(c_sensor)} (True: Constraints Narrowed)")
+    print(f"[Check] Hub ISA Hub?               {c_hub.is_subconcept_of(c_hub)} (True: Isa is Reflexive)")
+    print(f"[Check] Hub ISA Device?            {c_hub.is_subconcept_of(c_wireless_device)} (True: Role Narrowed)")
+    print(f"[Check] Device ISA Sensor?         {c_wireless_device.is_subconcept_of(c_sensor)} (False: Parent is not Child)")
+    print(f"[Check] WiredHub ISA Hub?          {c_wired_hub.is_subconcept_of(c_hub)} (False: Hub has no Battery)")
+    print(f"[Check] Hub ISA WiredHub?          {c_hub.is_subconcept_of(c_wired_hub)} (True: Hub has More Attributes)")
+
+    # Create Instances (World)
+    home_net = PossibleWorld("Home_Network")
+    kripke = KripkeStructure()
+    kripke.add_world(home_net)
     
-    # Bob mentors Alice
-    link_mentor = world.add_link(r_mentor, bob, alice)
-    print(f"Created link: {link_mentor}")
+    d_sens_ok = {"protocol": "ZigBee", "battery": 95, "role": "Sensor"} # Matches ReliableSensor
+    d_sens_low= {"protocol": "ZigBee", "battery": 10, "role": "Sensor"} # Matches Sensor, not Reliable
+    d_hub     = {"protocol": "WiFi",   "battery": 100, "role": "Hub"}    # Matches Hub
     
-    # Check: Is this 'Mentor' link also an 'Interact' link? (ISA on relations)
-    check_link_interact = link_mentor.is_instance_of(r_interact)
-    print(f"Check: Is link instance of 'Interact'? {check_link_interact} (Expected: True)")
+    home_net.add_object("s1_reliable", d_sens_ok)
+    home_net.add_object("s2_weak", d_sens_low)
+    home_net.add_object("h1_main", d_hub)
     
-    # Negative test
-    r_supervise = scale.register_relation("Supervise", c_staff, c_staff) # Dummy relation
-    check_link_supervise = link_mentor.is_instance_of(r_supervise)
-    print(f"Check: Is link instance of 'Supervise'? {check_link_supervise} (Expected: False)")
+    print(f"[World] Created objects: s1_reliable, s2_weak, h1_main")
+    
+    # Check Instances
+    print(f"[Instance] Is 's1_reliable' a ReliableSensor? {c_rel_sensor.check(d_sens_ok)}")
+    print(f"[Instance] Is 's2_weak' a ReliableSensor?    {c_rel_sensor.check(d_sens_low)}")
+    print(f"[Instance] Is 'h1_main' a Hub?               {c_hub.check(d_hub)}")
+
+    print("\n" + "="*50)
+    print("TASK 6 & 7: Relations & ISA on Relations")
+    print("="*50)
+    
+    # Base Relation
+    rel_connect = LinkFrame("Connection", source_type=c_wireless_device, dest_type=c_wireless_device)
+    
+    rel_crit_report = LinkFrame("CriticalReport", source_type=c_rel_sensor, dest_type=c_hub)
+    rel_wired_report = LinkFrame("WiredReport", source_type=c_rel_sensor, dest_type=c_wired_hub)
+
+
+    print(f"[Defined] {rel_connect.name} ({rel_connect.domain.name} -> {rel_connect.range_concept.name})")
+    print(f"[Defined] {rel_crit_report.name} ({rel_crit_report.domain.name} -> {rel_crit_report.range_concept.name})")
+    
+    is_sub = rel_crit_report.is_subframe_of(rel_connect)
+    print(f"[Check] CriticalReport ISA Connection? {is_sub} (Expected: True)")
+    print(f"[Check] WiredReport ISA Connection?    {rel_wired_report.is_subframe_of(rel_connect)} (Expected: False)")
+
+    print("\n" + "="*50)
+    print("TASK 8: Relation Instances (Frames)")
+    print("="*50)
+    
+    # Create Valid Frame
+    try:
+        frame1 = LinkFrameInstance(rel_crit_report, home_net, "s1_reliable", "h1_main")
+        print(f"[Frame Created] {frame1}")
+    except ValueError as e:
+        print(f"[Error] {e}")
+
+    # Check Instance-Of (Transitive)
+    check_isa_rel = frame1.is_instance_of(rel_crit_report)
+    check_isa_parent = frame1.is_instance_of(rel_connect)
+    
+    print(f"[Check] Frame ISA CriticalReport? {check_isa_rel}")
+    print(f"[Check] Frame ISA Connection?     {check_isa_parent} (Inherited)")
+
+    # Invalid Frame (Constraint Violation)
+    print("\n[Test] Attempting to link 's2_weak' (Low Battery) as 'CriticalReport'...")
+    try:
+        LinkFrameInstance(rel_crit_report, home_net, "s2_weak", "h1_main")
+    except ValueError as e:
+        print(f"[Caught Expected Error] {e}")
+
+    print("\n" + "="*50)
+    print("Extension Retrieval (Local World)")
+    print("="*50)
+    
+    ext_reliable = home_net.get_extension(c_rel_sensor)
+    print(f"[Extension] ReliableSensors in 'Home_Network': {ext_reliable}")
+
+    print("\n" + "="*50)
+    print("Reachable Extension (Kripke Worlds)")
+    print("="*50)
+    
+    # Create a reachable world
+    world_backup = PossibleWorld("Backup_Network")
+    kripke.add_world(world_backup)
+    kripke.add_access("Home_Network", "Backup_Network") # Home can access Backup
+    
+    # Add objects to Backup world
+    # s3_backup is a reliable sensor
+    d_sens_backup = {"protocol": "ZigBee", "battery": 99, "role": "Sensor"}
+    world_backup.add_object("s3_backup", d_sens_backup)
+    
+    print("[Setup] Created 'Backup_Network' accessible from 'Home_Network'")
+    print("[Setup] Added object 's3_backup' (ReliableSensor) to 'Backup_Network'")
+    
+    # Query Reachable Extensions from Home_Network
+    reachable_ext1 = kripke.get_reachable_extension("Home_Network", c_rel_sensor)
+    reachable_ext2 = kripke.get_reachable_extension("Home_Network", c_hub)
+    
+    print(f"\n[Query] Get reachable ReliableSensors starting from 'Home_Network'...")
+    print(f"[Result] {reachable_ext1}")
+
+    print(f"\n[Query] Get reachable Hub starting from 'Home_Network'...")
+    print(f"[Result] {reachable_ext2}")
 
 if __name__ == "__main__":
     run_scenario()
