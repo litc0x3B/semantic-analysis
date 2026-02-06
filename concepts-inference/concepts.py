@@ -1,18 +1,19 @@
-from typing import Any, Dict, Set, List, Optional
+from typing import Any, Dict, Set, List, Optional, NamedTuple, Tuple
 import operator
 
 
 class Constraint:
-    """Base class for constraints."""
     def check(self, value: Any) -> bool:
         raise NotImplementedError
     
     def implies(self, other: 'Constraint') -> bool:
-        """Returns True if (Self -> Other)."""
+        raise NotImplementedError
+    
+    def intersect(self, other: 'Constraint') -> 'Constraint':
         raise NotImplementedError
 
+
 class IntRange(Constraint):
-    """Interval constraint: min_val <= x <= max_val"""
     def __init__(self, min_val=float('-inf'), max_val=float('inf')):
         self.min_val = min_val
         self.max_val = max_val
@@ -27,12 +28,17 @@ class IntRange(Constraint):
         if isinstance(other, AnyValue):
             return True
         return False
+    
+    def intersect(self, other: 'Constraint') -> 'Constraint':
+        if not isinstance(other, IntRange):
+            raise TypeError("Cannot intersect constraints of different types")
+        return IntRange(max(self.min_val, other.min_val), min(self.max_val, other.max_val))
+
 
     def __repr__(self):
         return f"[{self.min_val}..{self.max_val}]"
 
 class ValueSet(Constraint):
-    """Set constraint: x IN allowed_values"""
     def __init__(self, allowed_values: Set[Any]):
         self.allowed = allowed_values
 
@@ -48,13 +54,19 @@ class ValueSet(Constraint):
 
     def __repr__(self):
         return f"In{self.allowed}"
+    
+    def intersect(self, other: 'Constraint') -> 'Constraint':
+        if not isinstance(other, ValueSet):
+            raise TypeError("Cannot intersect constraints of different types")
+        return ValueSet(self.allowed.intersection(other.allowed))
 
 class AnyValue(Constraint):
-    """Matches anything."""
     def check(self, value: Any) -> bool: return True
     def implies(self, other: 'Constraint') -> bool: 
         return isinstance(other, AnyValue)
     def __repr__(self): return "Any"
+    def intersect(self, other: 'Constraint') -> 'Constraint':
+        return other
 
 class BaseConcept:
     def check(self, data: Any) -> bool:
@@ -64,17 +76,20 @@ class BaseConcept:
         raise NotImplementedError
 
     def __and__(self, other):
-        """Concatenation operator (Concept1 ^ Concept2)."""
-        attrs = {}
+        attrs: Dict[str, AtomicConcept] = {}
         if isinstance(self, CompositeConcept):
             attrs.update(self.attributes)
         elif isinstance(self, AtomicConcept):
             attrs[self.name] = self
         
         if isinstance(other, CompositeConcept):
-            attrs.update(other.attributes) 
+            for key, atom in other.attributes.items():
+                if key not in attrs:
+                    attrs[key] = atom
+                else:
+                    attrs[key] = AtomicConcept(key, attrs[key].constraint.intersect(atom.constraint))
         elif isinstance(other, AtomicConcept):
-            attrs[other.name] = other
+            attrs[other.name] = AtomicConcept(other.name, other.constraint.intersect(attrs[other.name].constraint))
             
         return CompositeConcept(f"({self.name}^{other.name})", attrs)
 
@@ -107,7 +122,12 @@ class CompositeConcept(BaseConcept):
         return True
 
     def is_subconcept_of(self, other: 'BaseConcept') -> bool:
-        if isinstance(other, AtomicConcept): return False
+        if isinstance(other, AtomicConcept): 
+            return len(self.attributes) == 1 and \
+                   other.name in self.attributes \
+                   and self.attributes[other.name].constraint.implies(other.constraint)
+        
+                
         if isinstance(other, CompositeConcept):
             for key, other_atom in other.attributes.items():
                 if key not in self.attributes: return False
@@ -121,18 +141,12 @@ class CompositeConcept(BaseConcept):
 class LinkFrame:
     def __init__(self, name: str, source_type: BaseConcept, dest_type: BaseConcept):
         self.name = name
-        self.domain = source_type
-        self.range_concept = dest_type
+        self.source_type = source_type
+        self.dest_type = dest_type
 
     def is_subframe_of(self, other: 'LinkFrame') -> bool:
-        """
-        Subrelation Rule (Covariant):
-        Rel A ISA Rel B if:
-        1. Domain(A) ISA Domain(B)
-        2. Range(A) ISA Range(B)
-        """
-        return (self.domain.is_subconcept_of(other.domain) and 
-                self.range_concept.is_subconcept_of(other.range_concept))
+        return (self.source_type.is_subconcept_of(other.source_type) and 
+                self.dest_type.is_subconcept_of(other.dest_type))
 
     def __repr__(self):
         return f"RelType<{self.name}>"
@@ -140,18 +154,18 @@ class LinkFrame:
 class PossibleWorld:
     def __init__(self, name):
         self.name = name
-        self.objects = {} # uid -> data_dict
+        self.concepts: Dict[str, Dict[str, Any]] = {} # uid to data_dict
+        self.frames: Dict[str, Frame] = {}
 
-    def add_object(self, uid, data: Dict[str, Any]):
-        self.objects[uid] = data
-        return uid
+    def add_concept(self, name, data: Dict[str, Any]) -> 'PossibleWorld':
+        self.concepts[name] = data
+        return self
+    
+    def get_concept(self, uid: str) -> Dict[str, Any]:
+        return self.concepts.get(uid)
 
-    def get_extension(self, concept: BaseConcept) -> List[str]:
-        """
-        Returns the extension of the concept in this world 
-        (list of UIDs of objects that satisfy the concept).
-        """
-        return [uid for uid, data in self.objects.items() if concept.check(data)]
+    def get_extension(self, concept: BaseConcept) -> List[Tuple[str, Dict[str, Any]]]:
+        return [(uid, data) for uid, data in self.concepts.items() if concept.check(data)]
 
     def __repr__(self):
         return f"World<{self.name}>"
@@ -181,18 +195,68 @@ class KripkeStructure:
             
             world = self.worlds.get(current_name)
             if world:
-                # Get extension in this world
                 extension = world.get_extension(concept)
                 if extension:
                     results[current_name] = extension
             
-            # Add neighbors
             neighbors = self.accessibility.get(current_name, [])
             for neighbor in neighbors:
                 if neighbor not in visited:
                     queue.append(neighbor)
         
         return results
+
+class FrameArgInfo(NamedTuple):
+    name: str
+    role: str
+    type: BaseConcept
+    
+
+class Frame:
+    def __init__(self, name: str, argsInfo: List[FrameArgInfo]):
+        self.name = name
+        self.argsInfo = dict([(x.name, x) for x in argsInfo])
+        self._intersection = set([self])
+
+    def __and__(self, other: 'Frame'):
+        self.intersect(other, f"({self.name}^{other.name})")
+        
+    
+    def intersect(self, other: 'Frame', name: str):
+        argInfos = self.argsInfo.copy() 
+        argInfos.update([(k, v) for k, v in other.argsInfo.items() if k not in self.argsInfo.keys()])
+        sameNames = [(k, v) for k, v in other.argsInfo.items() if k in self.argsInfo.keys()]
+        for _, info in sameNames:
+            if self.argsInfo[info.name].role != info.role:
+                raise ValueError(f"Cannot intersect concepts: concepts depend on variable with the same name but different roles")
+            argInfos[info.name] = FrameArgInfo(type=info.type & self.argsInfo[info.name].type, name=info.name, role=info.role)
+
+        res = Frame(name, list(argInfos.values()))
+        res._intersection = self._intersection.union(other._intersection)
+        return res
+    
+    def is_subframe_of(self, other: 'Frame') -> bool:
+        return other._intersection.issubset(self._intersection)
+    
+    def __repr__(self):
+        return f"Frame[{self.name}]"
+
+
+class FrameInstance:
+    def __init__(self, frame: Frame, world: PossibleWorld, args: Dict[str, Dict[str, Any]]):
+        self.frame = frame
+        self.world = world
+        self.args = args
+        self.conceptInstances: Dict[str, Dict[str, Any]] = dict(map(lambda x: (x.value, self.world.concepts[x.value]), args))
+        for var_name, concept in self.conceptInstances.items():
+            if not self.frame.argsInfo[var_name].type.check(concept):
+                raise ValueError(f"Type mismatch: concept is not of subtype {self.frame.argsInfo[var_name].type}")
+
+    def __repr__(self):
+        return f"FrameInstance[{self.frame.name}]"
+    
+    def is_instance_of(self, target_frame: Frame) -> bool:
+        return self.frame.is_subframe_of(target_frame)
 
 
 class LinkFrameInstance:
@@ -204,17 +268,16 @@ class LinkFrameInstance:
         self._validate()
 
     def _validate(self):
-        """Checks if the connected objects satisfy the relation type definition."""
-        src_data = self.world.objects.get(self.source)
-        tgt_data = self.world.objects.get(self.target)
+        src_data = self.world.concepts.get(self.source)
+        tgt_data = self.world.concepts.get(self.target)
         
         if not src_data: raise ValueError(f"Source {self.source} not found.")
         if not tgt_data: raise ValueError(f"Target {self.target} not found.")
         
-        if not self.relation_type.domain.check(src_data):
-            raise ValueError(f"Source {self.source} does not satisfy domain {self.relation_type.domain.name}")
-        if not self.relation_type.range_concept.check(tgt_data):
-            raise ValueError(f"Target {self.target} does not satisfy range {self.relation_type.range_concept.name}")
+        if not self.relation_type.source_type.check(src_data):
+            raise ValueError(f"Source {self.source} does not satisfy source_type {self.relation_type.source_type.name}")
+        if not self.relation_type.dest_type.check(tgt_data):
+            raise ValueError(f"Target {self.target} does not satisfy dest_type {self.relation_type.dest_type.name}")
 
     def is_instance_of(self, target_rel_type: LinkFrame) -> bool:
         if self.relation_type == target_rel_type: return True
@@ -223,15 +286,10 @@ class LinkFrameInstance:
     def __repr__(self):
         return f"Frame[{self.relation_type.name}]({self.source} -> {self.target})"
 
-# ==========================================
-# Scenario Execution: IoT / Smart Home
-# ==========================================
-
 def run_scenario():
     print("\n" + "="*50)
     print("TASK 1 & 4: Define Domain & Concepts")
     print("Domain: IoT Smart Home")
-    print("Structure: Atomic Attributes -> Composite Concepts (Records)")
     print("="*50)
     
     # Attributes
@@ -287,9 +345,9 @@ def run_scenario():
     d_sens_low= {"protocol": "ZigBee", "battery": 10, "role": "Sensor"} # Matches Sensor, not Reliable
     d_hub     = {"protocol": "WiFi",   "battery": 100, "role": "Hub"}    # Matches Hub
     
-    home_net.add_object("s1_reliable", d_sens_ok)
-    home_net.add_object("s2_weak", d_sens_low)
-    home_net.add_object("h1_main", d_hub)
+    home_net.add_concept("s1_reliable", d_sens_ok)
+    home_net.add_concept("s2_weak", d_sens_low)
+    home_net.add_concept("h1_main", d_hub)
     
     print(f"[World] Created objects: s1_reliable, s2_weak, h1_main")
     
@@ -305,15 +363,15 @@ def run_scenario():
     # Base Relation
     rel_connect = LinkFrame("Connection", source_type=c_wireless_device, dest_type=c_wireless_device)
     
-    rel_crit_report = LinkFrame("CriticalReport", source_type=c_rel_sensor, dest_type=c_hub)
+    rel_report = LinkFrame("Report", source_type=c_rel_sensor, dest_type=c_hub)
     rel_wired_report = LinkFrame("WiredReport", source_type=c_rel_sensor, dest_type=c_wired_hub)
 
 
-    print(f"[Defined] {rel_connect.name} ({rel_connect.domain.name} -> {rel_connect.range_concept.name})")
-    print(f"[Defined] {rel_crit_report.name} ({rel_crit_report.domain.name} -> {rel_crit_report.range_concept.name})")
+    print(f"[Defined] {rel_connect.name} ({rel_connect.source_type.name} -> {rel_connect.dest_type.name})")
+    print(f"[Defined] {rel_report.name} ({rel_report.source_type.name} -> {rel_report.dest_type.name})")
     
-    is_sub = rel_crit_report.is_subframe_of(rel_connect)
-    print(f"[Check] CriticalReport ISA Connection? {is_sub} (Expected: True)")
+    is_sub = rel_report.is_subframe_of(rel_connect)
+    print(f"[Check] Report ISA Connection? {is_sub} (Expected: True)")
     print(f"[Check] WiredReport ISA Connection?    {rel_wired_report.is_subframe_of(rel_connect)} (Expected: False)")
 
     print("\n" + "="*50)
@@ -322,22 +380,22 @@ def run_scenario():
     
     # Create Valid Frame
     try:
-        frame1 = LinkFrameInstance(rel_crit_report, home_net, "s1_reliable", "h1_main")
+        frame1 = LinkFrameInstance(rel_report, home_net, "s1_reliable", "h1_main")
         print(f"[Frame Created] {frame1}")
     except ValueError as e:
         print(f"[Error] {e}")
 
     # Check Instance-Of (Transitive)
-    check_isa_rel = frame1.is_instance_of(rel_crit_report)
+    check_isa_rel = frame1.is_instance_of(rel_report)
     check_isa_parent = frame1.is_instance_of(rel_connect)
     
-    print(f"[Check] Frame ISA CriticalReport? {check_isa_rel}")
+    print(f"[Check] Frame ISA Report? {check_isa_rel}")
     print(f"[Check] Frame ISA Connection?     {check_isa_parent} (Inherited)")
 
     # Invalid Frame (Constraint Violation)
-    print("\n[Test] Attempting to link 's2_weak' (Low Battery) as 'CriticalReport'...")
+    print("\n[Test] Attempting to link 's2_weak' (Low Battery) as 'Report'...")
     try:
-        LinkFrameInstance(rel_crit_report, home_net, "s2_weak", "h1_main")
+        LinkFrameInstance(rel_report, home_net, "s2_weak", "h1_main")
     except ValueError as e:
         print(f"[Caught Expected Error] {e}")
 
@@ -360,7 +418,7 @@ def run_scenario():
     # Add objects to Backup world
     # s3_backup is a reliable sensor
     d_sens_backup = {"protocol": "ZigBee", "battery": 99, "role": "Sensor"}
-    world_backup.add_object("s3_backup", d_sens_backup)
+    world_backup.add_concept("s3_backup", d_sens_backup)
     
     print("[Setup] Created 'Backup_Network' accessible from 'Home_Network'")
     print("[Setup] Added object 's3_backup' (ReliableSensor) to 'Backup_Network'")
