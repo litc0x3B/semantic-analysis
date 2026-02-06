@@ -1,5 +1,16 @@
 from typing import Any, Dict, Set, List, Optional, NamedTuple, Tuple
+from enum import Enum
 import operator
+
+
+class Role(Enum):
+    INITIATOR = "Initiator"
+    RECEIVER = "Receiver"
+    CONTROLLER = "Controller"
+    MANAGED = "Managed"
+    GATEWAY = "Gateway"
+    TIMESTAMP = "Timestamp"
+    NODE = "Node"
 
 
 class Constraint:
@@ -17,6 +28,10 @@ class IntRange(Constraint):
     def __init__(self, min_val=float('-inf'), max_val=float('inf')):
         self.min_val = min_val
         self.max_val = max_val
+
+        if self.min_val > self.max_val:
+            raise ValueError("Minimum value cannot be greater than maximum value")
+
 
     def check(self, value: Any) -> bool:
         if not isinstance(value, (int, float)): return False
@@ -41,6 +56,10 @@ class IntRange(Constraint):
 class ValueSet(Constraint):
     def __init__(self, allowed_values: Set[Any]):
         self.allowed = allowed_values
+
+        if not self.allowed:
+            raise ValueError("Set of allowed values cannot be empty")
+
 
     def check(self, value: Any) -> bool:
         return value in self.allowed
@@ -75,7 +94,10 @@ class BaseConcept:
     def is_subconcept_of(self, other: 'BaseConcept') -> bool:
         raise NotImplementedError
 
-    def __and__(self, other):
+    def __and__(self, other: 'BaseConcept'):
+        return self.intersect(other, f"({self.name}^{other.name})" if self.name != other.name else self.name)
+    
+    def intersect(self, other: 'BaseConcept', name: str) -> 'BaseConcept':
         attrs: Dict[str, AtomicConcept] = {}
         if isinstance(self, CompositeConcept):
             attrs.update(self.attributes)
@@ -89,9 +111,12 @@ class BaseConcept:
                 else:
                     attrs[key] = AtomicConcept(key, attrs[key].constraint.intersect(atom.constraint))
         elif isinstance(other, AtomicConcept):
-            attrs[other.name] = AtomicConcept(other.name, other.constraint.intersect(attrs[other.name].constraint))
+            if other.name not in attrs:
+                attrs[other.name] = other
+            else:
+                attrs[other.name] = AtomicConcept(other.name, other.constraint.intersect(attrs[other.name].constraint))
             
-        return CompositeConcept(f"({self.name}^{other.name})", attrs)
+        return CompositeConcept(name, attrs)
 
 class AtomicConcept(BaseConcept):
     def __init__(self, name: str, constraint: Constraint):
@@ -136,36 +161,74 @@ class CompositeConcept(BaseConcept):
         return False
 
     def __repr__(self):
-        return f"Concept[{self.name}]"
+        attrs_str = ", ".join([str(atom) for atom in self.attributes.values()])
+        return f"Concept[{self.name}]({attrs_str})"
 
-class LinkFrame:
-    def __init__(self, name: str, source_type: BaseConcept, dest_type: BaseConcept):
+class FrameArgInfo(NamedTuple):
+    name: str
+    role: Role
+    type: BaseConcept
+    
+
+class Frame:
+    def __init__(self, name: str, argsInfo: List[FrameArgInfo]):
         self.name = name
-        self.source_type = source_type
-        self.dest_type = dest_type
+        self.argsInfo = dict([(x.name, x) for x in argsInfo])
+        self._intersection = set([self])
 
-    def is_subframe_of(self, other: 'LinkFrame') -> bool:
-        return (self.source_type.is_subconcept_of(other.source_type) and 
-                self.dest_type.is_subconcept_of(other.dest_type))
+    def __and__(self, other: 'Frame'):
+        return self.intersect(other, f"({self.name}^{other.name})")
+        
+    
+    def intersect(self, other: 'Frame', name: str):
+        argInfos = self.argsInfo.copy() 
+        argInfos.update([(k, v) for k, v in other.argsInfo.items() if k not in self.argsInfo.keys()])
+        sameNames = [(k, v) for k, v in other.argsInfo.items() if k in self.argsInfo.keys()]
+        for _, info in sameNames:
+            if self.argsInfo[info.name].role != info.role:
+                raise ValueError(f"Cannot intersect concepts: concepts depend on variable with the same name but different roles")
+            argInfos[info.name] = FrameArgInfo(type=info.type & self.argsInfo[info.name].type, name=info.name, role=info.role)
 
+        res = Frame(name, list(argInfos.values()))
+        res._intersection = self._intersection.union(other._intersection)
+        return res
+    
+    def is_subframe_of(self, other: 'Frame') -> bool:
+        return other._intersection.issubset(self._intersection)
+    
     def __repr__(self):
-        return f"RelType<{self.name}>"
+        args_str = ", ".join([f"{v.role.value}->{v.name}:{v.type.name}" for v in self.argsInfo.values()])
+        return f"Frame[{self.name}]({args_str})"
+
+
+class ConceptInstance:
+    def __init__(self, uid: str, data: Dict[str, Any]):
+        self.uid = uid
+        self.data = data
+    
+    def __repr__(self):
+        return f"Inst(name: {self.uid}, data:{self.data})"
+
 
 class PossibleWorld:
     def __init__(self, name):
         self.name = name
-        self.concepts: Dict[str, Dict[str, Any]] = {} # uid to data_dict
-        self.frames: Dict[str, Frame] = {}
+        self.concepts: Dict[str, ConceptInstance] = {} 
+        self.frames: List['FrameInstance'] = []
 
-    def add_concept(self, name, data: Dict[str, Any]) -> 'PossibleWorld':
-        self.concepts[name] = data
+    def add_concept(self, uid: str, data: Dict[str, Any]) -> 'PossibleWorld':
+        self.concepts[uid] = ConceptInstance(uid, data)
         return self
     
-    def get_concept(self, uid: str) -> Dict[str, Any]:
+    def add_frame(self, frame_inst: 'FrameInstance') -> 'PossibleWorld':
+        self.frames.append(frame_inst)
+        return self
+    
+    def get_concept(self, uid: str) -> Optional[ConceptInstance]:
         return self.concepts.get(uid)
 
-    def get_extension(self, concept: BaseConcept) -> List[Tuple[str, Dict[str, Any]]]:
-        return [(uid, data) for uid, data in self.concepts.items() if concept.check(data)]
+    def get_extension(self, concept: BaseConcept) -> List[ConceptInstance]:
+        return [inst for inst in self.concepts.values() if concept.check(inst.data)]
 
     def __repr__(self):
         return f"World<{self.name}>"
@@ -182,7 +245,7 @@ class KripkeStructure:
         if from_world not in self.accessibility: self.accessibility[from_world] = []
         self.accessibility[from_world].append(to_world)
 
-    def get_reachable_extension(self, start_world_name: str, concept: BaseConcept) -> Dict[str, List[str]]:
+    def get_reachable_extension(self, start_world_name: str, concept: BaseConcept) -> Dict[str, List[ConceptInstance]]:
         visited = set()
         queue = [start_world_name]
         results = {}
@@ -206,89 +269,43 @@ class KripkeStructure:
         
         return results
 
-class FrameArgInfo(NamedTuple):
-    name: str
-    role: str
-    type: BaseConcept
-    
-
-class Frame:
-    def __init__(self, name: str, argsInfo: List[FrameArgInfo]):
-        self.name = name
-        self.argsInfo = dict([(x.name, x) for x in argsInfo])
-        self._intersection = set([self])
-
-    def __and__(self, other: 'Frame'):
-        self.intersect(other, f"({self.name}^{other.name})")
-        
-    
-    def intersect(self, other: 'Frame', name: str):
-        argInfos = self.argsInfo.copy() 
-        argInfos.update([(k, v) for k, v in other.argsInfo.items() if k not in self.argsInfo.keys()])
-        sameNames = [(k, v) for k, v in other.argsInfo.items() if k in self.argsInfo.keys()]
-        for _, info in sameNames:
-            if self.argsInfo[info.name].role != info.role:
-                raise ValueError(f"Cannot intersect concepts: concepts depend on variable with the same name but different roles")
-            argInfos[info.name] = FrameArgInfo(type=info.type & self.argsInfo[info.name].type, name=info.name, role=info.role)
-
-        res = Frame(name, list(argInfos.values()))
-        res._intersection = self._intersection.union(other._intersection)
-        return res
-    
-    def is_subframe_of(self, other: 'Frame') -> bool:
-        return other._intersection.issubset(self._intersection)
-    
-    def __repr__(self):
-        return f"Frame[{self.name}]"
-
 
 class FrameInstance:
-    def __init__(self, frame: Frame, world: PossibleWorld, args: Dict[str, Dict[str, Any]]):
+    def __init__(self, frame: Frame, args: Dict[str, ConceptInstance]):
         self.frame = frame
-        self.world = world
         self.args = args
-        self.conceptInstances: Dict[str, Dict[str, Any]] = dict(map(lambda x: (x.value, self.world.concepts[x.value]), args))
-        for var_name, concept in self.conceptInstances.items():
-            if not self.frame.argsInfo[var_name].type.check(concept):
-                raise ValueError(f"Type mismatch: concept is not of subtype {self.frame.argsInfo[var_name].type}")
+        self._validate()
+
+    def _validate(self):
+        # 1. Validate argument presence
+        required_args = set(self.frame.argsInfo.keys())
+        provided_args = set(self.args.keys())
+        
+        if required_args != provided_args:
+             raise ValueError(f"Frame arguments mismatch. Required: {required_args}, Provided: {provided_args}")
+
+        # 2. Validate types
+        for var_name, concept_inst in self.args.items():
+            arg_info = self.frame.argsInfo[var_name]
+            if not arg_info.type.check(concept_inst.data):
+                raise ValueError(
+                    f"Argument '{var_name}' (uid='{concept_inst.uid}') violates type '{arg_info.type.name}'"
+                )
 
     def __repr__(self):
-        return f"FrameInstance[{self.frame.name}]"
+        parts = []
+        for var_name, inst in self.args.items():
+            arg_info = self.frame.argsInfo[var_name]
+            parts.append(f"{arg_info.role.value}->{inst.uid}:{arg_info.type.name}")
+        return f"FrameInstance[{self.frame.name}]({', '.join(parts)})"
     
     def is_instance_of(self, target_frame: Frame) -> bool:
         return self.frame.is_subframe_of(target_frame)
 
 
-class LinkFrameInstance:
-    def __init__(self, relation_type: LinkFrame, world: PossibleWorld, source_uid: str, target_uid: str):
-        self.relation_type = relation_type
-        self.world = world
-        self.source = source_uid
-        self.target = target_uid
-        self._validate()
-
-    def _validate(self):
-        src_data = self.world.concepts.get(self.source)
-        tgt_data = self.world.concepts.get(self.target)
-        
-        if not src_data: raise ValueError(f"Source {self.source} not found.")
-        if not tgt_data: raise ValueError(f"Target {self.target} not found.")
-        
-        if not self.relation_type.source_type.check(src_data):
-            raise ValueError(f"Source {self.source} does not satisfy source_type {self.relation_type.source_type.name}")
-        if not self.relation_type.dest_type.check(tgt_data):
-            raise ValueError(f"Target {self.target} does not satisfy dest_type {self.relation_type.dest_type.name}")
-
-    def is_instance_of(self, target_rel_type: LinkFrame) -> bool:
-        if self.relation_type == target_rel_type: return True
-        return self.relation_type.is_subframe_of(target_rel_type)
-
-    def __repr__(self):
-        return f"Frame[{self.relation_type.name}]({self.source} -> {self.target})"
-
 def run_scenario():
     print("\n" + "="*50)
-    print("TASK 1 & 4: Define Domain & Concepts")
+    print("Define Concepts")
     print("Domain: IoT Smart Home")
     print("="*50)
     
@@ -300,10 +317,11 @@ def run_scenario():
     atom_role_dev  = AtomicConcept("role", ValueSet({"Sensor", "Hub"}))
     atom_role_sen  = AtomicConcept("role", ValueSet({"Sensor"}))
     atom_role_hub  = AtomicConcept("role", ValueSet({"Hub"}))
+    
 
     # Concepts
-    c_wireless_device = atom_proto_any & atom_bat_any & atom_role_dev
-    c_wireless_device.name = "WirelessDevice"
+    с_device = atom_proto_any & atom_bat_any & atom_role_dev
+    с_device.name = "Device"
     
     c_sensor = atom_proto_zig & atom_bat_any & atom_role_sen
     c_sensor.name = "Sensor"
@@ -311,127 +329,194 @@ def run_scenario():
     c_rel_sensor = c_sensor & atom_bat_full
     c_rel_sensor.name = "ReliableSensor"
     
-    c_hub = c_wireless_device & atom_role_hub
+    c_hub = с_device & atom_role_hub
     c_hub.name = "Hub"
+    
 
-    c_wired_hub = atom_role_hub & atom_proto_any
-    c_wired_hub.name = "WiredHub"
-
-    print(f"[Defined] {c_wireless_device.name}")
+    print(f"[Defined] {с_device.name}")
     print(f"[Defined] {c_sensor.name}")
     print(f"[Defined] {c_rel_sensor.name}")
     print(f"[Defined] {c_hub.name}")
-    print(f"[Defined] {c_wired_hub.name}")
-
 
     print("\n" + "="*50)
-    print("TASK 5: Concept ISA & Instances")
+    print("Concept ISA & Instances Checks")
     print("="*50)
 
     # Check ISA
     print(f"[Check] ReliableSensor ISA Sensor? {c_rel_sensor.is_subconcept_of(c_sensor)} (True: Constraints Narrowed)")
-    print(f"[Check] Hub ISA Hub?               {c_hub.is_subconcept_of(c_hub)} (True: Isa is Reflexive)")
-    print(f"[Check] Hub ISA Device?            {c_hub.is_subconcept_of(c_wireless_device)} (True: Role Narrowed)")
-    print(f"[Check] Device ISA Sensor?         {c_wireless_device.is_subconcept_of(c_sensor)} (False: Parent is not Child)")
-    print(f"[Check] WiredHub ISA Hub?          {c_wired_hub.is_subconcept_of(c_hub)} (False: Hub has no Battery)")
-    print(f"[Check] Hub ISA WiredHub?          {c_hub.is_subconcept_of(c_wired_hub)} (True: Hub has More Attributes)")
+    print(f"[Check] Hub ISA Device?    {c_hub.is_subconcept_of(с_device)} (True: Role Narrowed)")
+    print(f"[Check] Device ISA Sensor? {с_device.is_subconcept_of(c_sensor)} (False: Parent is not Child)")
 
-    # Create Instances (World)
-    home_net = PossibleWorld("Home_Network")
-    kripke = KripkeStructure()
-    kripke.add_world(home_net)
+    # Create World
+    world = PossibleWorld("Home")
     
-    d_sens_ok = {"protocol": "ZigBee", "battery": 95, "role": "Sensor"} # Matches ReliableSensor
-    d_sens_low= {"protocol": "ZigBee", "battery": 10, "role": "Sensor"} # Matches Sensor, not Reliable
-    d_hub     = {"protocol": "WiFi",   "battery": 100, "role": "Hub"}    # Matches Hub
-    
-    home_net.add_concept("s1_reliable", d_sens_ok)
-    home_net.add_concept("s2_weak", d_sens_low)
-    home_net.add_concept("h1_main", d_hub)
-    
-    print(f"[World] Created objects: s1_reliable, s2_weak, h1_main")
-    
+    # Concept Instances
+    world.add_concept("hub_main", {"protocol": "WiFi",   "battery": 100, "role": "Hub"})
+    world.add_concept("hub_bridge", {"protocol": "WiFi", "battery": 100, "role": "Hub"})
+    world.add_concept("sensor_1", {"protocol": "ZigBee", "battery": 90,  "role": "Sensor"})
+    world.add_concept("sensor_weak", {"protocol": "ZigBee", "battery": 10, "role": "Sensor"})
+
+    print(f"[World] Created Concept Instances: hub_main, hub_bridge, sensor_1, sensor_weak")
+
     # Check Instances
-    print(f"[Instance] Is 's1_reliable' a ReliableSensor? {c_rel_sensor.check(d_sens_ok)}")
-    print(f"[Instance] Is 's2_weak' a ReliableSensor?    {c_rel_sensor.check(d_sens_low)}")
-    print(f"[Instance] Is 'h1_main' a Hub?               {c_hub.check(d_hub)}")
+    h_main_data = world.get_concept("hub_main").data
+    s1_data = world.get_concept("sensor_1").data
+    sw_data = world.get_concept("sensor_weak").data
+
+    print(f"[Instance] Is 'hub_main' a Hub?               {c_hub.check(h_main_data)}")
+    print(f"[Instance] Is 'sensor_1' a ReliableSensor?    {c_rel_sensor.check(s1_data)}")
+    print(f"[Instance] Is 'sensor_weak' a ReliableSensor? {c_rel_sensor.check(sw_data)} (False: Low Battery)")
 
     print("\n" + "="*50)
-    print("TASK 6 & 7: Relations & ISA on Relations")
+    print("Extensions (Local World)")
     print("="*50)
     
-    # Base Relation
-    rel_connect = LinkFrame("Connection", source_type=c_wireless_device, dest_type=c_wireless_device)
+    ext_hubs = world.get_extension(c_hub)
+    ext_rel_sensors = world.get_extension(c_rel_sensor)
     
-    rel_report = LinkFrame("Report", source_type=c_rel_sensor, dest_type=c_hub)
-    rel_wired_report = LinkFrame("WiredReport", source_type=c_rel_sensor, dest_type=c_wired_hub)
+    print(f"[Extension] Hubs: {ext_hubs}")
+    print(f"[Extension] Reliable Sensors: {ext_rel_sensors}")
 
-
-    print(f"[Defined] {rel_connect.name} ({rel_connect.source_type.name} -> {rel_connect.dest_type.name})")
-    print(f"[Defined] {rel_report.name} ({rel_report.source_type.name} -> {rel_report.dest_type.name})")
-    
-    is_sub = rel_report.is_subframe_of(rel_connect)
-    print(f"[Check] Report ISA Connection? {is_sub} (Expected: True)")
-    print(f"[Check] WiredReport ISA Connection?    {rel_wired_report.is_subframe_of(rel_connect)} (Expected: False)")
 
     print("\n" + "="*50)
-    print("TASK 8: Relation Instances (Frames)")
+    print("Frame Definitions & Partial Overlap Intersection")
+    print("="*50)
+
+    # Фрейм управления: Кто-то управляет чем-то
+    f_control = Frame("Control", [
+        FrameArgInfo(name="actor",  role=Role.CONTROLLER, type=c_hub),
+        FrameArgInfo(name="target", role=Role.MANAGED,    type=с_device)
+    ])
+
+    # Фрейм сетевой привязки: Устройство подключено к шлюзу
+    f_topology = Frame("Topology", [
+        FrameArgInfo(name="target",  role=Role.MANAGED, type=с_device),
+        FrameArgInfo(name="gateway", role=Role.GATEWAY, type=c_hub)
+    ])
+
+    # Фрейм-ограничитель: Цель должна быть сенсором
+    f_sensor_target = Frame("SensorTarget", [
+        FrameArgInfo(name="target", role=Role.MANAGED, type=c_sensor)
+    ])
+
+    print(f"[Defined] {f_control}")
+    print(f"[Defined] {f_topology}")
+    print(f"[Defined] {f_sensor_target}")
+    
+    print("\n--- Intersection Scenarios ---")
+    
+    # Case A: Partial Overlap (actor, target) & (target, gateway)
+    # Result should have variables: actor, target, gateway
+    f_routed_control = f_control & f_topology
+    f_routed_control.name = "RoutedControl"
+    print(f"\n[Intersect Partial Overlap] {f_control.name} & {f_topology.name}")
+    print(f"Result: {f_routed_control}")
+    
+    # Case B: Type Narrowing on a 3-argument frame
+    # RoutedControl & SensorTarget -> target type narrows to Sensor
+    f_secure_routed = f_routed_control & f_sensor_target
+    f_secure_routed.name = "SecureRoutedControl"
+    print(f"\n[Intersect Type Narrowing] {f_routed_control.name} & {f_sensor_target.name}")
+    print(f"Result: {f_secure_routed}")
+
+    print("\n" + "="*50)
+    print("Frame Instances & Validation")
     print("="*50)
     
-    # Create Valid Frame
+    # Reuse World 'Home' created earlier
+    
+    print("[World] Using existing concept instances: hub_main, hub_bridge, sensor_1")
+
+    # Retrieve instances
+    h_main = world.get_concept("hub_main")
+    h_bridge = world.get_concept("hub_bridge")
+    s1 = world.get_concept("sensor_1")
+
+    # 1. Valid Instance of RoutedControl (3 args)
+    print("\n[Test] Creating valid 'RoutedControl' instance (hub_main -> sensor_1 via hub_bridge)...")
     try:
-        frame1 = LinkFrameInstance(rel_report, home_net, "s1_reliable", "h1_main")
-        print(f"[Frame Created] {frame1}")
+        inst1 = FrameInstance(f_routed_control, {
+            "actor": h_main,
+            "target": s1,
+            "gateway": h_bridge
+        })
+        world.add_frame(inst1)
+        print(f"[Success] {inst1}")
     except ValueError as e:
-        print(f"[Error] {e}")
+        print(f"[Failed] {e}")
 
-    # Check Instance-Of (Transitive)
-    check_isa_rel = frame1.is_instance_of(rel_report)
-    check_isa_parent = frame1.is_instance_of(rel_connect)
-    
-    print(f"[Check] Frame ISA Report? {check_isa_rel}")
-    print(f"[Check] Frame ISA Connection?     {check_isa_parent} (Inherited)")
-
-    # Invalid Frame (Constraint Violation)
-    print("\n[Test] Attempting to link 's2_weak' (Low Battery) as 'Report'...")
+    # 2. Valid Instance of SecureRoutedControl
+    print("\n[Test] Creating valid 'SecureRoutedControl' instance...")
     try:
-        LinkFrameInstance(rel_report, home_net, "s2_weak", "h1_main")
+        inst2 = FrameInstance(f_secure_routed, {
+            "actor": h_main,
+            "target": s1,
+            "gateway": h_bridge
+        })
+        world.add_frame(inst2)
+        print(f"[Success] {inst2}")
+    except ValueError as e:
+        print(f"[Failed] {e}")
+
+    # 3. Invalid Instance (Target is Hub, but SecureRoutedControl requires Sensor)
+    print("\n[Test] Creating invalid 'SecureRoutedControl' (Target is Hub)...")
+    try:
+        FrameInstance(f_secure_routed, {
+            "actor": h_main,
+            "target": h_bridge, # hub_bridge is Hub, not Sensor
+            "gateway": h_main
+        })
     except ValueError as e:
         print(f"[Caught Expected Error] {e}")
 
     print("\n" + "="*50)
-    print("Extension Retrieval (Local World)")
+    print("Kripke & Extensions Check")
     print("="*50)
     
-    ext_reliable = home_net.get_extension(c_rel_sensor)
-    print(f"[Extension] ReliableSensors in 'Home_Network': {ext_reliable}")
+    print(f"[World] Frames in 'Home' world: {world.frames}")
+    
+    # Create Kripke Structure
+    kripke = KripkeStructure()
+    kripke.add_world(world)
+    
+    # Create another world 'Garage'
+    world_garage = PossibleWorld("Garage")
+    world_garage.add_concept("sensor_garage", {"protocol": "ZigBee", "battery": 85, "role": "Sensor"})
+    kripke.add_world(world_garage)
+    
+    # Link Home -> Garage
+    kripke.add_access("Home", "Garage")
+    
+    print("[Kripke] Added world 'Garage' accessible from 'Home'")
+    print("[Kripke] Added concept instance 'sensor_garage' to 'Garage'")
+    
+    # Check reachable extension
+    reachable = kripke.get_reachable_extension("Home", c_rel_sensor)
+    print(f"[Query] Reachable ReliableSensors starting from 'Home': {reachable}")
 
     print("\n" + "="*50)
-    print("Reachable Extension (Kripke Worlds)")
+    print("ISA on Frames (Subframe Relationships)")
     print("="*50)
     
-    # Create a reachable world
-    world_backup = PossibleWorld("Backup_Network")
-    kripke.add_world(world_backup)
-    kripke.add_access("Home_Network", "Backup_Network") # Home can access Backup
+    # A frame created by intersection is a subframe of its components
+    print(f"[Check] RoutedControl ISA Control?  {f_routed_control.is_subframe_of(f_control)} (True)")
+    print(f"[Check] RoutedControl ISA Topology? {f_routed_control.is_subframe_of(f_topology)} (True)")
+    print(f"[Check] Control ISA RoutedControl?  {f_control.is_subframe_of(f_routed_control)} (False)")
     
-    # Add objects to Backup world
-    # s3_backup is a reliable sensor
-    d_sens_backup = {"protocol": "ZigBee", "battery": 99, "role": "Sensor"}
-    world_backup.add_concept("s3_backup", d_sens_backup)
-    
-    print("[Setup] Created 'Backup_Network' accessible from 'Home_Network'")
-    print("[Setup] Added object 's3_backup' (ReliableSensor) to 'Backup_Network'")
-    
-    # Query Reachable Extensions from Home_Network
-    reachable_ext1 = kripke.get_reachable_extension("Home_Network", c_rel_sensor)
-    reachable_ext2 = kripke.get_reachable_extension("Home_Network", c_hub)
-    
-    print(f"\n[Query] Get reachable ReliableSensors starting from 'Home_Network'...")
-    print(f"[Result] {reachable_ext1}")
+    # Check instance membership
+    inst_routed = FrameInstance(f_routed_control, {"actor": h_main, "target": s1, "gateway": h_bridge})
+    print(f"\n[Instance] Created {inst_routed}")
+    print(f"[Check] Is instance of RoutedControl? {inst_routed.is_instance_of(f_routed_control)} (True)")
+    print(f"[Check] Is instance of Control?       {inst_routed.is_instance_of(f_control)} (true)")
+    print(f"[Check] Is instance of Topology?      {inst_routed.is_instance_of(f_topology)} (true)")
 
-    print(f"\n[Query] Get reachable Hub starting from 'Home_Network'...")
-    print(f"[Result] {reachable_ext2}")
+    inst_control = FrameInstance(f_control, {"actor": h_main, "target": s1})
+    print(f"\n[Instance] Created {inst_control}")
+    print(f"[Check] Is instance of RoutedControl? {inst_control.is_instance_of(f_routed_control)} (True)")
+    print(f"[Check] Is instance of Control?       {inst_control.is_instance_of(f_control)} (true)")
+    print(f"[Check] Is instance of Topology?      {inst_control.is_instance_of(f_topology)} (true)")
+    
+
 
 if __name__ == "__main__":
     run_scenario()
